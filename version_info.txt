@@ -1,8 +1,8 @@
 # PyInstaller 打包用的版本信息（写入 exe 的文件属性）
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 2, 0, 0),
-    prodvers=(1, 2, 0, 0),
+    filevers=(1, 3, 0, 0),
+    prodvers=(1, 3, 0, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,12 +16,12 @@ VSVersionInfo(
         '080404B0',
         [StringStruct('CompanyName', 'NetDiagnose'),
          StringStruct('FileDescription', '网络诊断工具 - 定位网站无法访问的原因'),
-         StringStruct('FileVersion', '1.2.0.0'),
+         StringStruct('FileVersion', '1.3.0.0'),
          StringStruct('InternalName', 'NetDiagnose'),
          StringStruct('LegalCopyright', 'Copyright (C) 2026'),
          StringStruct('OriginalFilename', 'NetDiagnose.exe'),
          StringStruct('ProductName', '网络诊断工具'),
-         StringStruct('ProductVersion', '1.2.0.0')])
+         StringStruct('ProductVersion', '1.3.0.0')])
     ]),
     VarFileInfo([VarStruct('Translation', [2052, 1200])])
   ]

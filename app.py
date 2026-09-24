@@ -30,7 +30,7 @@ from diagnoser import (  # noqa: E402
 )
 
 APP_TITLE = "网络诊断 · NetDiagnose"
-APP_VERSION = "1.2"
+APP_VERSION = "1.3"
 
 # ------------------------------------------------------------------ 设计令牌
 # 参考 WorkBuddy 的浅色视觉：白底卡片 + 极浅边框 + 单一强调色
@@ -876,7 +876,13 @@ class App:
         # 又最常被当成「工具抽风」的一环（工具走代理能通、浏览器直连不通）。
         browser = next((c.result for c in self.cards if c.result.key == "browser"), None)
         if browser is not None and browser.level in (Level.WARN, Level.FAIL):
-            summary = (browser.summary or "").replace("系统代理已启用，但 ", "")
+            summary = (browser.summary or "")
+            for prefix in ("系统代理已启用，但 ", "各层链路正常，但 "):
+                if summary.startswith(prefix):
+                    summary = summary[len(prefix):]
+            # 徽标是标题栏右侧那一行，太长会把左侧标题挤变形，超出就截断
+            if len(summary) > 24:
+                summary = summary[:23] + "…"
             self.refresh_proxy_badge(f"⚠ {summary}", C["warn"])
         elif browser is not None and browser.level == Level.OK:
             self.refresh_proxy_badge("浏览器已跟随代理", C["ok"])

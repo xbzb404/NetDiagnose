@@ -22,6 +22,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Callable, Iterable, Optional
 
+import browserext
+
 # ---------------------------------------------------------------- 基础设施
 
 IS_WINDOWS = platform.system() == "Windows"
@@ -601,8 +603,28 @@ def _tasklist_pids() -> dict:
     return result
 
 
+def _is_public_ip(ip: str) -> bool:
+    """是不是公网地址。
+
+    用来区分「浏览器把流量交给了代理/局域网」和「浏览器自己直连了公网」——
+    后者才是「流量没经过代理」的硬证据。局域网地址不算：访问内网本来就不该走代理。
+    """
+    try:
+        addr = ipaddress.ip_address(ip.split("%")[0])
+    except ValueError:
+        return False
+    return bool(getattr(addr, "is_global", False))
+
+
 def _netstat_rows() -> list:
-    """``netstat -ano`` 的 TCP 连接表：``(local_ip, local_port, remote_ip, remote_port, pid)``。"""
+    """``netstat -ano`` 的连接表，每行
+    ``(local_ip, local_port, remote_ip, remote_port, pid, state)``。
+
+    保留状态是必要的：只看「有没有到代理端口的连接」时状态无所谓，
+    但判断「浏览器有没有自己直连公网」时，只有 ESTABLISHED 才算数 ——
+    把 TIME_WAIT / CLOSE_WAIT 一起算进来会得到一堆早就结束的连接。
+    UDP 行没有连接状态，状态位留空串。
+    """
     code, out = run_cmd(["netstat", "-ano"], timeout=25)
     if code != 0 or not out:
         return []
@@ -614,9 +636,9 @@ def _netstat_rows() -> list:
         if parts[0].upper() == "TCP":
             if len(parts) < 5:
                 continue
-            local, remote, _state, pid_s = parts[1], parts[2], parts[3], parts[4]
+            local, remote, state, pid_s = parts[1], parts[2], parts[3], parts[4]
         else:
-            local, remote, pid_s = parts[1], parts[2], parts[3]
+            local, remote, state, pid_s = parts[1], parts[2], "", parts[3]
         try:
             pid = int(pid_s)
         except ValueError:
@@ -634,7 +656,7 @@ def _netstat_rows() -> list:
 
         l_ip, l_port = _split(local)
         r_ip, r_port = _split(remote)
-        rows.append((l_ip, l_port, r_ip, r_port, pid))
+        rows.append((l_ip, l_port, r_ip, r_port, pid, state.upper()))
     return rows
 
 
@@ -662,7 +684,8 @@ def _browser_cmdlines() -> dict:
     return result
 
 
-def check_browser_proxy_usage(proxy_server: str) -> dict:
+def check_browser_proxy_usage(proxy_server: str,
+                              target_ips: Iterable[str] = ()) -> dict:
     """判断「跑着的浏览器有没有真的把流量交给系统代理」。
 
     做法是最直接的证据法：看浏览器的连接表里有没有**到代理端口**的连接。
@@ -674,15 +697,33 @@ def check_browser_proxy_usage(proxy_server: str) -> dict:
     之后只在收到系统变更通知时才跟随；代理软件重启、崩溃、切换节点
     都可能让浏览器停在「直连」状态，而设置看起来一切正常。
 
+    光看代理端口还不够：**「有连接走代理」不等于「所有流量都走了代理」**。
+    带 ``chrome.proxy`` 权限的扩展可以按站点规则分流，于是浏览器一边连代理、
+    一边直连另一个站点 —— 此时只看代理端口的连接会得出「一切正常」的错误结论。
+    所以这里再把浏览器**对公网 IP 的直连**也捞出来（``direct_peers``），
+    并把其中命中本次目标域名解析地址的那些单独标出（``target_direct``）。
+
     返回 ``{"browsers": {...}, "using": [...], "direct_only": [...],
-            "overrides": [...], "proxy_port": int}``。
+            "overrides": [...], "proxy_port": int,
+            "direct_peers": [...], "direct_count": int,
+            "target_direct": [...]}``。
     """
     out = {"browsers": {}, "using": [], "direct_only": [],
-           "overrides": [], "proxy_port": 0, "checked": False}
+           "overrides": [], "proxy_port": 0, "checked": False,
+           "direct_peers": [], "direct_count": 0, "target_direct": []}
     if not IS_WINDOWS:
         return out
     port = parse_proxy_port(proxy_server)
     out["proxy_port"] = port or 0
+
+    # 代理服务器自身的地址：如果代理不是本机的（比如 192.168.x.x 或公网），
+    # 浏览器到它的连接不能被当成「直连公网」。
+    proxy_host = ""
+    hostport = parse_proxy_server(proxy_server) or ""
+    if hostport:
+        proxy_host = hostport.rsplit(":", 1)[0].strip("[]")
+
+    targets = {str(ip).split("%")[0] for ip in (target_ips or []) if ip}
 
     pids = _tasklist_pids()
     if not pids:
@@ -717,17 +758,33 @@ def check_browser_proxy_usage(proxy_server: str) -> dict:
             by_pid[pid] = label
 
     hit = set()
-    if port:
-        for _l_ip, _l_port, r_ip, r_port, pid in _netstat_rows():
-            if pid not in by_pid:
-                continue
-            if r_port != port:
-                continue
-            if r_ip not in ("127.0.0.1", "::1", "0.0.0.0", "::"):
-                continue
+    peers: dict = {}
+    for _l_ip, _l_port, r_ip, r_port, pid, state in _netstat_rows():
+        if pid not in by_pid:
+            continue
+        # 只看活着的连接：UDP 没有状态位（QUIC 就走这里），TCP 认 ESTABLISHED
+        if state and state != "ESTABLISHED":
+            continue
+        if port and r_port == port and (r_ip in ("127.0.0.1", "::1", "0.0.0.0", "::")
+                                       or (proxy_host and r_ip == proxy_host)):
             hit.add(by_pid[pid])
+            continue
+        if not _is_public_ip(r_ip):
+            continue
+        if proxy_host and r_ip == proxy_host:
+            continue
+        peers[(by_pid[pid], r_ip, r_port)] = True
+
     out["using"] = sorted(hit)
     out["direct_only"] = sorted(set(by_pid.values()) - hit)
+
+    ordered = sorted(peers)
+    out["direct_count"] = len(ordered)
+    out["direct_peers"] = [{"browser": who, "ip": ip, "port": p}
+                           for who, ip, p in ordered[:12]]
+    out["target_direct"] = [{"browser": who, "ip": ip, "port": p}
+                            for who, ip, p in ordered if ip in targets]
+
     out["checked"] = True
     return out
 
@@ -1293,7 +1350,9 @@ class StepBrowserProxy(Step):
         proxy = self.ctx.proxy or read_system_proxy()
         self.ctx.proxy = proxy
         hostport = parse_proxy_server(proxy.get("server", ""))
-        info = check_browser_proxy_usage(proxy.get("server", ""))
+        # 把本次目标的解析结果一起带上：浏览器到它的连接是不是直连，
+        # 比「浏览器有没有走代理」更能直接解释「为什么这个站打不开」。
+        info = check_browser_proxy_usage(proxy.get("server", ""), self.ctx.resolved)
         self.ctx.findings["browser_proxy"] = info
         dt = time.perf_counter() - t0
 
@@ -1306,6 +1365,14 @@ class StepBrowserProxy(Step):
                 Level.SKIP, "当前没有正在运行的浏览器，无需核对",
                 "检测方式：看浏览器进程有没有到代理端口的已建立连接。\n"
                 "没有浏览器在跑时这一步没有可核对的对象。", duration=dt)
+
+        # 第二问：浏览器「有没有能力绕过」系统代理。
+        # 只看连接表会漏掉一种现场 —— 扩展按站点规则分流，浏览器一边连代理、
+        # 一边直连某个站点，连接表里看着一切正常。所以顺手把扩展配置也读一遍。
+        ext = browserext.audit(labels=list(browsers.keys()))
+        self.ctx.findings["browser_ext"] = ext
+        suspects = browserext.bypass_suspects(ext)
+        dt = time.perf_counter() - t0
 
         names = "、".join(f"{k}（{v} 个进程）" for k, v in browsers.items())
         lines = [f"· 正在运行的浏览器：{names}"]
@@ -1320,36 +1387,106 @@ class StepBrowserProxy(Step):
         if info.get("overrides"):
             for item in info["overrides"]:
                 lines.append(f"· ⚠ 命令行覆盖：{item}")
+        if info.get("direct_count"):
+            sample = "、".join(f"{p['ip']}:{p['port']}"
+                              for p in info["direct_peers"][:3])
+            extra = (f" 等 {info['direct_count']} 条"
+                     if info["direct_count"] > len(info["direct_peers"][:3]) else "")
+            lines.append(f"· 浏览器对公网直连（没走代理）：{sample}{extra}")
+        targets = info.get("target_direct") or []
+        if targets:
+            ips = "、".join(sorted({p["ip"] for p in targets}))
+            lines.append(f"· ⚠ 其中命中本次目标地址（{self.ctx.host} → {ips}）："
+                         f"{len(targets)} 条，这些流量绕过了代理")
+        lines += browserext.summary_lines(ext)
         detail = "\n".join(lines)
 
         if info.get("overrides"):
+            advice = ["命令行开关的优先级高于系统设置，系统代理配得再对也不会生效。",
+                      "用这个参数启动的浏览器窗口，请关掉它、改成正常方式启动（双击图标）后复测。"]
+            if suspects:
+                advice.append(f"另外，{'、'.join(suspects)} 也能改写浏览器代理，"
+                              "建议一并确认它的情景模式。")
             return self.result(
-                Level.WARN, "浏览器启动参数覆盖了系统代理", detail,
-                ["命令行开关的优先级高于系统设置，系统代理配得再对也不会生效。",
-                 "用这个参数启动的浏览器窗口，请关掉它、改成正常方式启动（双击图标）后复测。"], dt)
+                Level.WARN, "浏览器启动参数覆盖了系统代理", detail, advice, dt)
 
         if not info.get("proxy_port"):
             return self.result(
                 Level.INFO, "系统代理未指向具体端口，无法核对",
                 detail + "\n（系统代理没用代理服务器，或走的是 PAC 脚本）", duration=dt)
 
-        if info.get("using"):
+        # 目标站被直连 —— 比「浏览器全程直连」更硬的一条证据：
+        # 别的站走没走代理都不重要，本次要访问的这个确实没走。
+        if targets:
+            self.ctx.findings["browser_target_direct"] = targets
+            who = "、".join(sorted({p["browser"] for p in targets}))
+            ips = "、".join(sorted({p["ip"] for p in targets}))
+            advice = [
+                f"浏览器与 {self.ctx.host}（{ips}）之间是直连，这条流量没有交给代理。"
+                "工具和命令行走代理能通、浏览器却打不开，差别就在这里。",
+            ]
+            if suspects:
+                advice.append(
+                    f"最可能动过代理的是：{'、'.join(suspects)} —— 它已启用且持有 proxy 权限，"
+                    "优先级高于系统代理。打开它的情景模式改成 [系统代理]（或直接禁用）后刷新页面。")
+            else:
+                advice.append(
+                    "按域名分流的规则都可能把某个站点判成直连：浏览器扩展的自动切换、"
+                    "PAC 脚本、代理客户端的绕过列表。逐项确认目标站没被排除在外。")
+            advice.append("被直连的站点通常报 ERR_CONNECTION_RESET / ERR_TIMED_OUT；"
+                          "报 ERR_PROXY_CONNECTION_FAILED 才是代理本身不可用。")
             return self.result(
-                Level.OK, f"{'、'.join(info['using'])} 确认正在使用系统代理", detail,
-                ["浏览器与代理端口之间确实有活动连接，说明它读到了系统代理并照做了。"], dt)
+                Level.WARN, f"{who} 正在直连 {self.ctx.host}，没有走系统代理",
+                detail, advice, dt)
+
+        if info.get("using"):
+            # 有连接走代理，但对公网另有直连 —— 可能是绕过列表，也可能是
+            # 按站点分流。单独看这两条都不算异常，合起来才说明
+            # 「有流量没走代理」。这里只报信息级：实测本机在一切正常时
+            # 也存在 2 条公网直连（扩展自己访问的国内接口等），
+            # 报成告警会让每一次诊断都无谓地变黄。
+            advice = ["浏览器与代理端口之间确实有活动连接，说明它读到了系统代理并照做了。"]
+            if info.get("direct_count"):
+                advice.append(
+                    f"另有 {info['direct_count']} 条公网直连没走代理，通常是代理绕过列表、"
+                    "国内站点直连规则，或扩展自己发起的请求。"
+                    "只有打不开的站点恰好在里面时才需要处理。")
+            if suspects:
+                advice.append(
+                    f"要注意 {'、'.join(suspects)} 已启用且持有 proxy 权限 —— "
+                    "它能按站点改写代理（自动切换），且系统设置里看不出来。"
+                    "只有个别站点打不开时，先看它的情景模式。")
+            if info.get("direct_count"):
+                return self.result(
+                    Level.INFO,
+                    f"{'、'.join(info['using'])} 在走代理，但另有 "
+                    f"{info['direct_count']} 条公网直连",
+                    detail, advice, dt)
+            return self.result(
+                Level.OK, f"{'、'.join(info['using'])} 确认正在使用系统代理",
+                detail, advice, dt)
 
         # 系统代理开着、浏览器在跑，却没有一条到代理端口的连接 —— 这就是
         # 「工具能通、浏览器打不开」的现场。
         self.ctx.findings["browser_direct_only"] = True
+        advice = []
+        if suspects:
+            advice.append(
+                f"先看这个：{'、'.join(suspects)} —— 已启用且能接管浏览器代理。"
+                "它的情景模式停在「直接连接」就是全程直连，"
+                "系统代理设置里完全看不出来。打开它改成 [系统代理]，或先禁用。")
+        advice += [
+            "浏览器只在启动时读一次系统代理，之后只在收到系统变更通知时才跟随。",
+            "代理软件重启过、切换过节点、或崩溃重连过，都会让已经在跑的浏览器停在直连状态。",
+            "处置：完全退出浏览器（任务管理器里确认没有 msedge.exe / chrome.exe 残留）后重新打开，再复测。",
+        ]
+        if not suspects:
+            advice.append("若重启浏览器后仍然直连：禁用带 proxy 权限的浏览器扩展"
+                          "（SwitchyOmega / ZeroOmega 一类可以覆盖系统设置）。")
         return self.result(
             Level.WARN,
             f"系统代理已启用，但 {'、'.join(info['direct_only'])} 没有走它",
-            detail,
-            ["浏览器只在启动时读一次系统代理，之后只在收到系统变更通知时才跟随。",
-             "代理软件重启过、切换过节点、或崩溃重连过，都会让已经在跑的浏览器停在直连状态。",
-             "处置：完全退出浏览器（任务管理器里确认没有 msedge.exe / chrome.exe 残留）后重新打开，再复测。",
-             "若重启浏览器后仍然直连，检查浏览器扩展：带 proxy 权限的扩展"
-             "（如 SwitchyOmega 一类）可以覆盖系统设置，禁用后再试。"], dt)
+            detail, advice, dt)
 
 
 class StepRoute(Step):
@@ -1792,6 +1929,10 @@ class StepHttpProxyAdvice(Step):
         used_proxy = proxy_on and not proxy_broken
         # 浏览器层：系统代理开着不代表浏览器在用（见 StepBrowserProxy）
         browser_direct = bool(f.get("browser_direct_only"))
+        browser_target_direct = f.get("browser_target_direct") or []
+        browser_ext = f.get("browser_ext") or {}
+        # 能改写浏览器代理的东西的名字（扩展 / Firefox 自带代理设置）
+        bypass_owner = "、".join(browserext.bypass_suspects(browser_ext)) if browser_ext else ""
         proxy_conflict = f.get("proxy_conflict") or ""
         browser_info = f.get("browser_proxy") or {}
         dns_ok = bool(self.ctx.resolved)
@@ -1837,21 +1978,45 @@ class StepHttpProxyAdvice(Step):
             # 各层都通了，但浏览器层有硬证据说明它没跟上系统代理 ——
             # 这正是「命令行/工具能通、浏览器打不开」的现场，不能笼统地
             # 用「问题多半在浏览器本身」带过去。
+            if browser_target_direct:
+                who = "、".join(sorted({p["browser"] for p in browser_target_direct}))
+                ips = "、".join(sorted({p["ip"] for p in browser_target_direct}))
+                advice = [f"浏览器与 {self.ctx.host}（{ips}）之间是直连，这条流量绕过了系统代理；"
+                          "工具走代理能通、浏览器打不开，差别就在这里。"]
+                if bypass_owner:
+                    advice.append(f"最可能改写代理的是 {bypass_owner} —— 它已启用且持有 proxy 权限，"
+                                  "优先级高于系统代理，可以按站点自动切换。")
+                    advice.append("把它的情景模式改成 [系统代理]（或先禁用）后刷新页面再试。")
+                else:
+                    advice.append("逐项检查按域名分流的规则：扩展的自动切换、PAC 脚本、"
+                                  "代理客户端的绕过列表，看目标站有没有被排除在外。")
+                return self.result(
+                    Level.WARN,
+                    f"各层链路正常，但 {who} 对 {self.ctx.host} 是直连",
+                    f"本机 → 路由器 → 公网 → DNS → 目标端口全部通过；"
+                    f"浏览器也有到代理端口的连接，但对目标站解析出的地址（{ips}）"
+                    f"另外建了一条直连 —— 说明这部分流量没交给代理。",
+                    advice, 0)
             if browser_direct:
                 who = "、".join(browser_info.get("direct_only") or []) or "正在运行的浏览器"
+                advice = ["浏览器只在启动时读一次系统代理设置，之后只在收到系统变更通知时才跟随。"
+                          "代理软件重启过、切换过节点或崩溃重连过，都会让已在运行的浏览器停在直连状态。",
+                          "完全退出浏览器（任务管理器确认没有 msedge.exe / chrome.exe 残留）后重新打开，再复测。"]
+                if bypass_owner:
+                    advice.append(f"重启后仍然直连就看 {bypass_owner}：它已启用且能接管浏览器代理，"
+                                  "把情景模式改成 [系统代理] 或直接禁用。")
+                else:
+                    advice.append("若重启后仍然直连：禁用带 proxy 权限的浏览器扩展"
+                                  "（SwitchyOmega / ZeroOmega 一类可以覆盖系统设置）。")
+                advice.append("浏览器直连被限制的站点时，报错通常是 ERR_CONNECTION_RESET —— "
+                              "看到这个错误就优先怀疑这里。")
                 return self.result(
                     Level.WARN,
                     f"各层链路正常，但 {who} 没有走系统代理",
                     f"本机 → 路由器 → 公网 → DNS → 目标端口全部通过，"
                     f"系统代理也指向 {parse_proxy_server(self.ctx.proxy.get('server', '')) or '已启用'}；"
                     f"但浏览器的连接表里没有任何一条到代理端口的连接，说明它在直连。",
-                    ["浏览器只在启动时读一次系统代理设置，之后只在收到系统变更通知时才跟随。"
-                     "代理软件重启过、切换过节点或崩溃重连过，都会让已在运行的浏览器停在直连状态。",
-                     "完全退出浏览器（任务管理器确认没有 msedge.exe / chrome.exe 残留）后重新打开，再复测。",
-                     "若重启后仍然直连：禁用带 proxy 权限的浏览器扩展"
-                     "（SwitchyOmega / Proxy SwitchyOmega 一类可以覆盖系统设置）。",
-                     "浏览器直连被限制的站点时，报错通常是 ERR_CONNECTION_RESET —— "
-                     "看到这个错误就优先怀疑这里。"], 0)
+                    advice, 0)
             if tcp_ok:
                 note = "本次是经代理访问的，代理链路正常。" if used_proxy else ""
                 page = ""
