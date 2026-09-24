@@ -6,6 +6,7 @@ __pycache__/
 # ---------- 构建产物 ----------
 build/
 dist/
+*.spec
 _probedist*/
 _probebuild*/
 _probespec*/

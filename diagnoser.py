@@ -338,36 +338,168 @@ def collect_dns_servers() -> list[str]:
 
 # ---------------------------------------------------------------- 代理探测
 
+# WinINET 把同一份代理配置存在两个地方，且**浏览器读的是第二处**：
+#   1. 传统值 ProxyEnable / ProxyServer / ProxyOverride / AutoConfigURL
+#   2. 二进制块 Connections\DefaultConnectionSettings（INTERNET_PER_CONN_OPTION 序列）
+# 两处不同步时会出现「注册表显示代理已开、浏览器实际在直连」——
+# 只看第 1 处的排查手段（包括本工具早期版本）会给出完全错误的结论。
+INET_SETTINGS_KEY = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+INET_CONNECTIONS_KEY = INET_SETTINGS_KEY + r"\Connections"
+
+FLAG_PROXY = 0x02        # 为局域网使用代理服务器
+FLAG_AUTODETECT = 0x04   # 自动检测设置
+FLAG_PAC = 0x08          # 使用自动配置脚本
+
+
+def _reg_read(root, path: str, name: str):
+    try:
+        import winreg  # type: ignore
+        with winreg.OpenKey(root, path) as key:
+            return winreg.QueryValueEx(key, name)[0]
+    except Exception:
+        return None
+
+
+def parse_wininet_blob(blob: bytes) -> Optional[dict]:
+    """解析 ``DefaultConnectionSettings`` 二进制块。
+
+    布局：``<I`` 版本 + ``<I`` 写入计数 + ``<I`` 标志位，
+    之后是三组「``<I`` 字节数 + 内容」（代理服务器 / 绕过列表 / PAC 地址）。
+    字符串按 GBK 解（中文系统写进去的是本地 ANSI 编码）。
+    """
+    if not blob or len(blob) < 16:
+        return None
+    try:
+        version, counter, flags = struct.unpack_from("<III", blob, 0)
+    except struct.error:
+        return None
+    off = 12
+    out = {"version": version, "counter": counter, "flags": flags,
+           "enabled": bool(flags & FLAG_PROXY)}
+    for name in ("proxy_server", "bypass", "pac_url"):
+        if off + 4 > len(blob):
+            out[name] = ""
+            continue
+        (size,) = struct.unpack_from("<I", blob, off)
+        off += 4
+        if size <= 0 or off + size > len(blob):
+            out[name] = ""
+            continue
+        out[name] = blob[off:off + size].decode("gbk", "replace") \
+            .rstrip("\x00").strip()
+        off += size
+    return out
+
+
+def read_wininet_dual() -> dict:
+    """把 WinINET 的两份代理存储都读出来并**对拍**。
+
+    ``conflict`` 取值：
+      ``""``            两处一致（或只读到一处）
+      ``legacy_only``   传统值说「代理已启用」，二进制块说「没用代理」
+                        → 浏览器在**直连**，而按传统值排查的人会以为代理好好的
+      ``binary_only``   二进制块里有代理，传统值说关着
+      ``server_diff``   两处都启用但服务器地址不同
+    """
+    out = {
+        "legacy_enabled": False, "legacy_server": "", "legacy_bypass": "",
+        "legacy_pac": "",
+        "binary_enabled": False, "binary_server": "", "binary_bypass": "",
+        "binary_pac": "", "binary_flags": 0, "binary_parsed": False,
+        "conflict": "",
+    }
+    if not IS_WINDOWS:
+        return out
+    import winreg  # type: ignore
+
+    out["legacy_enabled"] = (
+        _reg_read(winreg.HKEY_CURRENT_USER, INET_SETTINGS_KEY, "ProxyEnable") == 1)
+    out["legacy_server"] = _reg_read(
+        winreg.HKEY_CURRENT_USER, INET_SETTINGS_KEY, "ProxyServer") or ""
+    out["legacy_bypass"] = _reg_read(
+        winreg.HKEY_CURRENT_USER, INET_SETTINGS_KEY, "ProxyOverride") or ""
+    out["legacy_pac"] = _reg_read(
+        winreg.HKEY_CURRENT_USER, INET_SETTINGS_KEY, "AutoConfigURL") or ""
+
+    blob = _reg_read(winreg.HKEY_CURRENT_USER, INET_CONNECTIONS_KEY,
+                     "DefaultConnectionSettings")
+    parsed = parse_wininet_blob(blob) if blob else None
+    if parsed is None:
+        blob = _reg_read(winreg.HKEY_CURRENT_USER,
+                         INET_CONNECTIONS_KEY + r"\0",
+                         "DefaultConnectionSettings")
+        parsed = parse_wininet_blob(blob) if blob else None
+    if parsed is not None:
+        out["binary_parsed"] = True
+        out["binary_flags"] = parsed["flags"]
+        out["binary_enabled"] = parsed["enabled"]
+        out["binary_server"] = parsed.get("proxy_server", "")
+        out["binary_bypass"] = parsed.get("bypass", "")
+        out["binary_pac"] = parsed.get("pac_url", "")
+
+    le, be = out["legacy_enabled"], out["binary_enabled"]
+    ls, bs = out["legacy_server"], out["binary_server"]
+    if out["binary_parsed"]:
+        if le and not be:
+            out["conflict"] = "legacy_only"
+        elif be and not le:
+            out["conflict"] = "binary_only"
+        elif le and be and ls and bs and ls.strip() != bs.strip():
+            out["conflict"] = "server_diff"
+    return out
+
+
+CONFLICT_TEXT = {
+    "legacy_only": "注册表两处不一致：浏览器按「不使用代理」在直连",
+    "binary_only": "注册表两处不一致：浏览器按「使用代理」在走代理",
+    "server_diff": "注册表两处不一致：两处写的代理地址不同",
+}
+
+
 def read_system_proxy() -> dict:
-    """读取 IE/WinINET 系统代理设置（多数软件遵循此设置）。"""
-    result = {"enabled": False, "server": "", "bypass": "", "pac": ""}
+    """读取系统代理设置（WinINET）。
+
+    以**二进制块**为「生效值」—— Chromium / Edge / IE 实际读的就是它；
+    传统值一并带出来用于对拍与提示。
+    """
+    result = {"enabled": False, "server": "", "bypass": "", "pac": "",
+              "source": "", "dual": {}, "conflict": ""}
     if not IS_WINDOWS:
         for var in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"):
             if os.environ.get(var):
-                result.update(enabled=True, server=os.environ[var], source="环境变量")
+                result.update(enabled=True, server=os.environ[var],
+                              source="环境变量")
                 return result
         return result
-    try:
-        import winreg  # type: ignore
-        key = winreg.OpenKey(
-            winreg.HKEY_CURRENT_USER,
-            r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
-        )
-        try:
-            enabled, _ = winreg.QueryValueEx(key, "ProxyEnable")
-            result["enabled"] = bool(enabled)
-        except FileNotFoundError:
-            pass
-        for field_name, reg_name in (("server", "ProxyServer"), ("bypass", "ProxyOverride"), ("pac", "AutoConfigURL")):
-            try:
-                val, _ = winreg.QueryValueEx(key, reg_name)
-                result[field_name] = val or ""
-            except FileNotFoundError:
-                pass
-        winreg.CloseKey(key)
-    except Exception:
-        pass
-    env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") or os.environ.get("HTTP_PROXY")
+
+    dual = read_wininet_dual()
+    result["dual"] = dual
+    result["conflict"] = dual["conflict"]
+
+    if dual["binary_parsed"]:
+        if dual["binary_enabled"]:
+            result.update(enabled=True, server=dual["binary_server"],
+                          bypass=dual["binary_bypass"], source="二进制块")
+        elif dual["legacy_enabled"]:
+            # 二进制块说没代理 —— 浏览器会直连。这里**仍报 enabled=True**
+            # （传统值确实开着，很多软件也确实按传统值走），
+            # 但把 source 标出来，让归因层能区分「浏览器走不走」。
+            result.update(enabled=True, server=dual["legacy_server"],
+                          bypass=dual["legacy_bypass"], source="传统值（浏览器未跟随）")
+        else:
+            result.update(source="二进制块")
+    elif dual["legacy_enabled"]:
+        result.update(enabled=True, server=dual["legacy_server"],
+                      bypass=dual["legacy_bypass"], source="传统值")
+
+    pac = dual["legacy_pac"] or dual["binary_pac"]
+    if pac:
+        result["pac"] = pac
+    if not result["enabled"] and pac:
+        result.update(enabled=True, server="", source="PAC")
+
+    env_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy") \
+        or os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
     if env_proxy:
         result["env"] = env_proxy
     return result
@@ -422,6 +554,182 @@ def probe_local_proxy_ports(host="127.0.0.1", timeout=0.35) -> list[int]:
     for t in threads:
         t.join(timeout + 0.3)
     return sorted(open_ports)
+
+
+# ------------------------------------------------- 浏览器有没有真的在走代理
+
+# 会自己读系统代理的主流浏览器进程名
+BROWSER_PROCS = {
+    "msedge.exe": "Microsoft Edge",
+    "chrome.exe": "Google Chrome",
+    "firefox.exe": "Firefox",
+    "iexplore.exe": "Internet Explorer",
+    "360se.exe": "360 安全浏览器",
+    "360chrome.exe": "360 极速浏览器",
+    "sogouexplorer.exe": "搜狗浏览器",
+    "qqbrowser.exe": "QQ 浏览器",
+    "2345explorer.exe": "2345 浏览器",
+    "brave.exe": "Brave",
+    "opera.exe": "Opera",
+    "vivaldi.exe": "Vivaldi",
+    "ucbrowser.exe": "UC 浏览器",
+}
+
+# 这些 Chromium 开关会直接改写浏览器的代理行为，优先级高于系统设置
+BROWSER_PROXY_SWITCHES = (
+    ("--no-proxy-server", "命令行强制直连（--no-proxy-server）"),
+    ("--proxy-server=", "命令行指定了代理（--proxy-server=）"),
+    ("--proxy-pac-url=", "命令行指定了 PAC（--proxy-pac-url=）"),
+    ("--proxy-auto-detect", "命令行要求自动探测代理（--proxy-auto-detect）"),
+)
+
+
+def _tasklist_pids() -> dict:
+    """PID → 进程名。走系统自带 tasklist（编码稳定，不触发 PowerShell）。"""
+    code, out = run_cmd(["tasklist", "/fo", "csv", "/nh"], timeout=20)
+    if code != 0 or not out:
+        return {}
+    import csv as _csv
+    import io as _io
+    result = {}
+    for row in _csv.reader(_io.StringIO(out)):
+        if len(row) >= 2:
+            try:
+                result[int(row[1].strip())] = row[0].strip()
+            except ValueError:
+                continue
+    return result
+
+
+def _netstat_rows() -> list:
+    """``netstat -ano`` 的 TCP 连接表：``(local_ip, local_port, remote_ip, remote_port, pid)``。"""
+    code, out = run_cmd(["netstat", "-ano"], timeout=25)
+    if code != 0 or not out:
+        return []
+    rows = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 4 or parts[0].upper() not in ("TCP", "UDP"):
+            continue
+        if parts[0].upper() == "TCP":
+            if len(parts) < 5:
+                continue
+            local, remote, _state, pid_s = parts[1], parts[2], parts[3], parts[4]
+        else:
+            local, remote, pid_s = parts[1], parts[2], parts[3]
+        try:
+            pid = int(pid_s)
+        except ValueError:
+            continue
+
+        def _split(text):
+            if text.startswith("["):
+                end = text.find("]")
+                host = text[1:end] if end > 0 else text
+                rest = text[end + 1:] if end > 0 else ""
+                port = int(rest[1:]) if rest.startswith(":") and rest[1:].isdigit() else 0
+                return host, port
+            host, _, p = text.rpartition(":")
+            return host, (int(p) if p.isdigit() else 0)
+
+        l_ip, l_port = _split(local)
+        r_ip, r_port = _split(remote)
+        rows.append((l_ip, l_port, r_ip, r_port, pid))
+    return rows
+
+
+def _browser_cmdlines() -> dict:
+    """在跑的浏览器 → 命令行。用于识别 ``--proxy-server`` 这类覆盖开关。
+
+    只取匹配到的几个进程，不做全量枚举；拿不到就返回空表（不影响主结论）。
+    """
+    script = ("Get-CimInstance Win32_Process | "
+              "Where-Object { $_.CommandLine } | "
+              "ForEach-Object { \"$($_.ProcessId)|$($_.Name)|$($_.CommandLine)\" }")
+    code, out = run_cmd(["powershell", "-NoProfile", "-NonInteractive",
+                         "-Command", script], timeout=25)
+    result = {}
+    if code != 0 or not out:
+        return result
+    for line in out.splitlines():
+        if line.count("|") < 2:
+            continue
+        pid_s, name, cmd = line.split("|", 2)
+        name = name.strip().lower()
+        if name not in BROWSER_PROCS:
+            continue
+        result[name] = result.get(name, "") or cmd.strip()
+    return result
+
+
+def check_browser_proxy_usage(proxy_server: str) -> dict:
+    """判断「跑着的浏览器有没有真的把流量交给系统代理」。
+
+    做法是最直接的证据法：看浏览器的连接表里有没有**到代理端口**的连接。
+    只要有一个浏览器进程存在到 ``127.0.0.1:<代理端口>`` 的已建立连接，
+    就说明它在走代理；一个都没有，就说明它在直连。
+
+    这个判据比看设置更可靠 —— 因为它测的是**已发生的事实**，
+    而不是「设置应该怎么走」。浏览器在启动时读一次代理设置，
+    之后只在收到系统变更通知时才跟随；代理软件重启、崩溃、切换节点
+    都可能让浏览器停在「直连」状态，而设置看起来一切正常。
+
+    返回 ``{"browsers": {...}, "using": [...], "direct_only": [...],
+            "overrides": [...], "proxy_port": int}``。
+    """
+    out = {"browsers": {}, "using": [], "direct_only": [],
+           "overrides": [], "proxy_port": 0, "checked": False}
+    if not IS_WINDOWS:
+        return out
+    port = parse_proxy_port(proxy_server)
+    out["proxy_port"] = port or 0
+
+    pids = _tasklist_pids()
+    if not pids:
+        return out
+    running = {}
+    for pid, name in pids.items():
+        label = BROWSER_PROCS.get(name.lower())
+        if label:
+            running.setdefault(label, []).append(pid)
+    out["browsers"] = {k: len(v) for k, v in running.items()}
+    if not running:
+        out["checked"] = True
+        return out
+
+    # 命令行覆盖开关：优先级高于系统设置，命中就是硬证据
+    cmds = _browser_cmdlines()
+    for name, cmd in cmds.items():
+        low = cmd.lower()
+        for token, desc in BROWSER_PROXY_SWITCHES:
+            if token in low:
+                detail = desc
+                if token.endswith("="):
+                    detail += low.split(token, 1)[1].split()[0]
+                out["overrides"].append(f"{BROWSER_PROCS.get(name, name)}：{detail}")
+                break
+    # 同一个浏览器多个进程时，命令行通常会带上 --type=renderer 这类子进程参数，
+    # 上面按进程名去重已经只留一条，不会刷屏。
+
+    by_pid = {}
+    for label, pid_list in running.items():
+        for pid in pid_list:
+            by_pid[pid] = label
+
+    hit = set()
+    if port:
+        for _l_ip, _l_port, r_ip, r_port, pid in _netstat_rows():
+            if pid not in by_pid:
+                continue
+            if r_port != port:
+                continue
+            if r_ip not in ("127.0.0.1", "::1", "0.0.0.0", "::"):
+                continue
+            hit.add(by_pid[pid])
+    out["using"] = sorted(hit)
+    out["direct_only"] = sorted(set(by_pid.values()) - hit)
+    out["checked"] = True
+    return out
 
 
 # ---------------------------------------------------------------- 各诊断步骤
@@ -906,19 +1214,50 @@ class StepProxy(Step):
         expected_port = parse_proxy_port(proxy.get("server", ""))
         hostport = parse_proxy_server(proxy.get("server", ""))
         listening = expected_port in open_ports if expected_port else False
+        dual = proxy.get("dual") or {}
+        conflict = proxy.get("conflict", "")
 
         lines = []
         if proxy.get("enabled") and proxy.get("server"):
-            lines.append(f"· 系统代理：已启用 → {hostport}")
+            src = proxy.get("source") or "系统设置"
+            lines.append(f"· 系统代理：已启用 → {hostport}（取自{src}）")
         elif proxy.get("pac"):
             lines.append(f"· 自动配置脚本（PAC）：{proxy['pac']}")
         else:
             lines.append("· 系统代理：未启用")
+
+        # 两处存储对拍 —— 这是「设置界面看着好好的、浏览器却直连」的根源
+        if dual.get("binary_parsed"):
+            lines.append(
+                "· 注册表对拍：传统值 "
+                f"{'开' if dual['legacy_enabled'] else '关'}"
+                f"（{dual['legacy_server'] or '无地址'}） / "
+                f"二进制块 {'开' if dual['binary_enabled'] else '关'}"
+                f"（{dual['binary_server'] or '无地址'}，"
+                f"标志 0x{dual['binary_flags']:08X}）")
+            if conflict:
+                lines.append(f"· ⚠ {CONFLICT_TEXT.get(conflict, '两处不一致')}")
+                lines.append("  浏览器只认二进制块这一份 —— 以它为准。")
+        else:
+            lines.append("· 注册表对拍：未读到 Connections\\DefaultConnectionSettings")
+
         if proxy.get("env"):
-            lines.append(f"· 环境变量代理：{proxy['env']}")
-        lines.append(f"· 本机代理端口在监听：{', '.join(str(p) for p in open_ports) if open_ports else '无（7890 / 10809 / 1080 等均未监听）'}")
+            lines.append(f"· 进程环境变量代理：{proxy['env']}")
+        lines.append(f"· 本机代理端口在监听："
+                     f"{', '.join(str(p) for p in open_ports) if open_ports else '无（7890 / 10809 / 1080 等均未监听）'}")
         dt = time.perf_counter() - t0
         detail = "\n".join(lines)
+
+        # 两处不一致要排在「端口没监听」之前报：它更隐蔽，
+        # 而且只要它成立，后面按代理测出来的「通」并不能代表浏览器也通。
+        if conflict:
+            self.ctx.findings["proxy_conflict"] = conflict
+            advice = ["在「Internet 选项 → 连接 → 局域网设置」里重新勾一次代理并确定，"
+                      "或让代理软件重新写入一次系统代理 —— 这一步会让两块同步。",
+                      "同步后建议重启浏览器：它只在启动时读一次代理设置。"]
+            return self.result(
+                Level.WARN, CONFLICT_TEXT.get(conflict, "系统代理两处配置不一致"),
+                detail, advice, dt)
 
         if proxy.get("enabled") and hostport and not listening:
             self.ctx.findings["proxy_broken"] = True
@@ -930,13 +1269,87 @@ class StepProxy(Step):
 
         if proxy.get("enabled") and hostport and listening:
             return self.result(Level.INFO, f"代理生效中（{hostport}），本机端口正常监听", detail,
-                               ["代理链路会影响连通性判断。若要排除目标站点自身问题，可临时关闭代理做对比测试。"], dt)
+                               ["代理链路会影响连通性判断。若要排除目标站点自身问题，可临时关闭代理做对比测试。",
+                                "注意：系统代理开了不等于浏览器在用 —— 下一步会核对浏览器是否真的把流量交给了它。"], dt)
 
         if proxy.get("pac"):
             return self.result(Level.WARN, "启用了 PAC 自动配置脚本", detail,
                                ["PAC 脚本异常会导致部分站点解析或转发错误，可临时关闭后复测。"], dt)
 
         return self.result(Level.OK, "未使用代理，直连网络", detail, duration=dt)
+
+
+class StepBrowserProxy(Step):
+    key = "browser"
+    title = "浏览器是否真的走了代理"
+
+    def run(self) -> CheckResult:
+        """核对「系统代理开着」与「浏览器在用代理」这两件事是不是同一件事。
+
+        判据是浏览器的**连接表**里有没有到代理端口的已建立连接 ——
+        测的是已发生的事实，而不是「设置应该怎么走」。
+        """
+        t0 = time.perf_counter()
+        proxy = self.ctx.proxy or read_system_proxy()
+        self.ctx.proxy = proxy
+        hostport = parse_proxy_server(proxy.get("server", ""))
+        info = check_browser_proxy_usage(proxy.get("server", ""))
+        self.ctx.findings["browser_proxy"] = info
+        dt = time.perf_counter() - t0
+
+        if not IS_WINDOWS:
+            return self.skipped("非 Windows 平台，跳过浏览器代理跟随检测。")
+
+        browsers = info.get("browsers") or {}
+        if not browsers:
+            return self.result(
+                Level.SKIP, "当前没有正在运行的浏览器，无需核对",
+                "检测方式：看浏览器进程有没有到代理端口的已建立连接。\n"
+                "没有浏览器在跑时这一步没有可核对的对象。", duration=dt)
+
+        names = "、".join(f"{k}（{v} 个进程）" for k, v in browsers.items())
+        lines = [f"· 正在运行的浏览器：{names}"]
+        if info.get("proxy_port"):
+            lines.append(f"· 系统代理端口：127.0.0.1:{info['proxy_port']}")
+        if info.get("using"):
+            lines.append(f"· 已确认走代理：{'、'.join(info['using'])}")
+        else:
+            lines.append("· 已确认走代理：无")
+        if info.get("direct_only"):
+            lines.append(f"· 未见代理连接：{'、'.join(info['direct_only'])}")
+        if info.get("overrides"):
+            for item in info["overrides"]:
+                lines.append(f"· ⚠ 命令行覆盖：{item}")
+        detail = "\n".join(lines)
+
+        if info.get("overrides"):
+            return self.result(
+                Level.WARN, "浏览器启动参数覆盖了系统代理", detail,
+                ["命令行开关的优先级高于系统设置，系统代理配得再对也不会生效。",
+                 "用这个参数启动的浏览器窗口，请关掉它、改成正常方式启动（双击图标）后复测。"], dt)
+
+        if not info.get("proxy_port"):
+            return self.result(
+                Level.INFO, "系统代理未指向具体端口，无法核对",
+                detail + "\n（系统代理没用代理服务器，或走的是 PAC 脚本）", duration=dt)
+
+        if info.get("using"):
+            return self.result(
+                Level.OK, f"{'、'.join(info['using'])} 确认正在使用系统代理", detail,
+                ["浏览器与代理端口之间确实有活动连接，说明它读到了系统代理并照做了。"], dt)
+
+        # 系统代理开着、浏览器在跑，却没有一条到代理端口的连接 —— 这就是
+        # 「工具能通、浏览器打不开」的现场。
+        self.ctx.findings["browser_direct_only"] = True
+        return self.result(
+            Level.WARN,
+            f"系统代理已启用，但 {'、'.join(info['direct_only'])} 没有走它",
+            detail,
+            ["浏览器只在启动时读一次系统代理，之后只在收到系统变更通知时才跟随。",
+             "代理软件重启过、切换过节点、或崩溃重连过，都会让已经在跑的浏览器停在直连状态。",
+             "处置：完全退出浏览器（任务管理器里确认没有 msedge.exe / chrome.exe 残留）后重新打开，再复测。",
+             "若重启浏览器后仍然直连，检查浏览器扩展：带 proxy 权限的扩展"
+             "（如 SwitchyOmega 一类）可以覆盖系统设置，禁用后再试。"], dt)
 
 
 class StepRoute(Step):
@@ -1377,6 +1790,10 @@ class StepHttpProxyAdvice(Step):
         proxy_broken = f.get("proxy_broken")
         proxy_on = bool(self.ctx.proxy.get("enabled") and parse_proxy_server(self.ctx.proxy.get("server", "")))
         used_proxy = proxy_on and not proxy_broken
+        # 浏览器层：系统代理开着不代表浏览器在用（见 StepBrowserProxy）
+        browser_direct = bool(f.get("browser_direct_only"))
+        proxy_conflict = f.get("proxy_conflict") or ""
+        browser_info = f.get("browser_proxy") or {}
         dns_ok = bool(self.ctx.resolved)
         http_fail = bool(f.get("http_fail"))
         web_status = f.get("web_status")
@@ -1389,6 +1806,10 @@ class StepHttpProxyAdvice(Step):
         if proxy_broken:
             problems.append("系统代理的本地端口没有监听")
             advice.append("先关闭系统代理，或重新启动代理客户端——这是最高频的原因。")
+        if proxy_conflict:
+            problems.append(CONFLICT_TEXT.get(proxy_conflict, "系统代理两处配置不一致"))
+            advice.append("在「Internet 选项 → 连接 → 局域网设置」里重新勾一次代理并确定，"
+                          "让传统值与二进制块同步；同步后重启浏览器再复测。")
         if not adapters_ok:
             problems.append("本机没有有效 IP 地址")
         if f.get("internet_unreachable"):
@@ -1413,6 +1834,24 @@ class StepHttpProxyAdvice(Step):
             advice.append("这是服务端故障而不是你的网络：稍后重试，或换个入口访问。")
 
         if not problems:
+            # 各层都通了，但浏览器层有硬证据说明它没跟上系统代理 ——
+            # 这正是「命令行/工具能通、浏览器打不开」的现场，不能笼统地
+            # 用「问题多半在浏览器本身」带过去。
+            if browser_direct:
+                who = "、".join(browser_info.get("direct_only") or []) or "正在运行的浏览器"
+                return self.result(
+                    Level.WARN,
+                    f"各层链路正常，但 {who} 没有走系统代理",
+                    f"本机 → 路由器 → 公网 → DNS → 目标端口全部通过，"
+                    f"系统代理也指向 {parse_proxy_server(self.ctx.proxy.get('server', '')) or '已启用'}；"
+                    f"但浏览器的连接表里没有任何一条到代理端口的连接，说明它在直连。",
+                    ["浏览器只在启动时读一次系统代理设置，之后只在收到系统变更通知时才跟随。"
+                     "代理软件重启过、切换过节点或崩溃重连过，都会让已在运行的浏览器停在直连状态。",
+                     "完全退出浏览器（任务管理器确认没有 msedge.exe / chrome.exe 残留）后重新打开，再复测。",
+                     "若重启后仍然直连：禁用带 proxy 权限的浏览器扩展"
+                     "（SwitchyOmega / Proxy SwitchyOmega 一类可以覆盖系统设置）。",
+                     "浏览器直连被限制的站点时，报错通常是 ERR_CONNECTION_RESET —— "
+                     "看到这个错误就优先怀疑这里。"], 0)
             if tcp_ok:
                 note = "本次是经代理访问的，代理链路正常。" if used_proxy else ""
                 page = ""
@@ -1456,6 +1895,7 @@ def default_steps() -> list[type[Step]]:
         StepPing,
         StepTcp,
         StepProxy,
+        StepBrowserProxy,
         StepHttp,
         StepWebPage,
         StepTls,

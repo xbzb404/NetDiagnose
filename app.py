@@ -30,7 +30,7 @@ from diagnoser import (  # noqa: E402
 )
 
 APP_TITLE = "网络诊断 · NetDiagnose"
-APP_VERSION = "1.1"
+APP_VERSION = "1.2"
 
 # ------------------------------------------------------------------ 设计令牌
 # 参考 WorkBuddy 的浅色视觉：白底卡片 + 极浅边框 + 单一强调色
@@ -337,13 +337,16 @@ class App:
         self.events: queue.Queue = queue.Queue()
         self.cards: list[CheckCard] = []
         self.stop_flag = threading.Event()
-        self.total_steps = 13
+        # 初始值只是占位：真正跑起来时用 run_engine 里的 len(engine.steps) 覆盖，
+        # 免得以后增删步骤还要记得改这里。
+        self.total_steps = 14
         self.done_steps = 0
         self.port_var = tk.StringVar(value="443")
 
         self.setup_fonts()
         self.setup_window()
         self.build_ui()
+        self.refresh_proxy_badge()
         self.pump_events()
         self.root.after(150, lambda: self.entry_host.focus_set())
 
@@ -448,7 +451,46 @@ class App:
         right = tk.Frame(bar, bg=C["bg"])
         right.pack(side="right", fill="y")
         tk.Label(right, text=f"v{APP_VERSION}", bg=C["bg"], fg=C["text_muted"],
-                 font=self.fonts["tiny"]).pack(anchor="e", pady=(14, 0))
+                 font=self.fonts["tiny"]).pack(anchor="e", pady=(8, 0))
+        # 系统代理状态常驻显示：它决定了后面所有「连不通」的结论该怎么解读
+        # —— 走代理测出来的「通」，不等于浏览器也通。
+        self.proxy_badge = tk.Label(right, text="系统代理：检测中…", bg=C["bg"],
+                                    fg=C["text_muted"], font=self.fonts["tiny"],
+                                    anchor="e", justify="right")
+        self.proxy_badge.pack(anchor="e", pady=(2, 0))
+
+    def refresh_proxy_badge(self, extra: str = "", extra_level: str = ""):
+        """把系统代理状态写到标题栏右侧那一行。
+
+        只读注册表，不跑 netstat —— 可以随时同步调用。
+        """
+        lbl = getattr(self, "proxy_badge", None)
+        if lbl is None:
+            return
+        try:
+            p = read_system_proxy()
+        except Exception as exc:  # noqa: BLE001
+            lbl.configure(text=f"系统代理：读取失败（{exc}）", fg=C["text_muted"])
+            return
+
+        hostport = parse_proxy_server(p.get("server", "")) if p.get("enabled") else None
+        if p.get("conflict"):
+            text = "系统代理：注册表两处不一致"
+            fg = C["warn"]
+        elif hostport:
+            text = f"系统代理：{hostport}"
+            fg = C["ok"]
+        elif p.get("pac"):
+            text = "系统代理：走 PAC 脚本"
+            fg = C["ok"]
+        else:
+            text = "系统代理：未启用（直连）"
+            fg = C["text_muted"]
+        if extra:
+            text = f"{text}　·　{extra}"
+            if extra_level:
+                fg = extra_level
+        lbl.configure(text=text, fg=fg)
 
     def build_input_card(self, parent):
         # 注意：RoundedFrame 是 Canvas，pack 后必须固定高度，
@@ -830,6 +872,17 @@ class App:
 
     def on_finish(self):
         self.set_running(False)
+        # 浏览器层的结论回写到标题栏那一行：这是整份诊断里最容易被忽略、
+        # 又最常被当成「工具抽风」的一环（工具走代理能通、浏览器直连不通）。
+        browser = next((c.result for c in self.cards if c.result.key == "browser"), None)
+        if browser is not None and browser.level in (Level.WARN, Level.FAIL):
+            summary = (browser.summary or "").replace("系统代理已启用，但 ", "")
+            self.refresh_proxy_badge(f"⚠ {summary}", C["warn"])
+        elif browser is not None and browser.level == Level.OK:
+            self.refresh_proxy_badge("浏览器已跟随代理", C["ok"])
+        else:
+            self.refresh_proxy_badge()
+
         verdict = next((c.result for c in reversed(self.cards) if c.result.key == "advice"), None)
         if verdict is None:
             verdict = self.cards[-1].result if self.cards else None
