@@ -1,0 +1,38 @@
+# ---------- Python ----------
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ---------- 构建产物 ----------
+build/
+dist/
+_probedist*/
+_probebuild*/
+_probespec*/
+_dbgbuild*/
+_dbgdist*/
+_dbgspec*/
+_m2build/
+_m2dist/
+_m2spec/
+_minbuild/
+_mindist/
+_minspec/
+_vbuild/
+_vdist/
+_vspec/
+*_old_[0-9]*/
+
+# ---------- 运行 / 开发产物 ----------
+_shots/
+*.log
+_probe_result.json
+
+# ---------- 本地待清理残留 ----------
+_可安全删除-重启后/
+
+# ---------- 编辑器 / 系统 ----------
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
