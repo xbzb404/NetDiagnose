@@ -24,14 +24,16 @@
 | `github.com` | `github.com:443/` |
 | `https://github.com/login` | `github.com:443/login` |
 | `github.com/login?tab=repositories#top` | `github.com:443/login` |
-| `github.com:8080` / `//github.com/login` | 按端口 / 路径解析 |
+| `github.com:8080` | `github.com:8080/` |
+| `//github.com/login` | `github.com:443/login` |
 | `<https://github.com>` / `**https://github.com**` / `"https://github.com"` | `github.com:443/` |
 | `[GitHub 登录](https://github.com/login)` | `github.com:443/login` |
 | `看这个 https://github.com/login 能不能开` | `github.com:443/login` |
 | `看这个 https://github.com/login。 能不能开` | `github.com:443/login` |
-| `http：／／github．com／login`（全角符号） | `github.com:443/login` |
+| `http：／／github．com／login`（全角冒号 / 点 / 斜杠） | `github.com:80/login`（还原成 `http://`，故走 80） |
 | `http://example.com` | `example.com:80/` |
-| `192.168.1.1` / `[::1]:443` | 原样作为主机 |
+| `192.168.1.1` | `192.168.1.1:443/` |
+| `[::1]:443` | `[::1]:443/` |
 
 粘贴后输入框下方会**实时回显「将诊断：…」**，确认无误再点开始。除 Ctrl+V 外，
 还提供「粘贴」按钮与输入框右键菜单（粘贴并解析 / 复制 / 清空）。
