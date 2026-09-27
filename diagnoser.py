@@ -539,6 +539,160 @@ def parse_proxy_port(raw: str) -> Optional[int]:
 PROXY_PORTS = (7890, 7891, 7897, 10809, 10808, 1080, 8080, 8888, 1087, 2080, 33210, 4780)
 
 
+# ---------------------------------------------------------------- 协议 / 端口
+
+# 协议 → 默认端口。用户把 `ssh://host`、`ftp://host/pub` 这类链接粘进来时，
+# 光把协议前缀剥掉是不够的 —— 端口必须跟着协议走，否则 ssh://host 会被当成
+# 443 去测握手，诊断结论从根上就是错的（实测确认过这个坑）。
+SCHEME_PORTS: dict[str, int] = {
+    # Web
+    "http": 80, "https": 443, "ws": 80, "wss": 443,
+    # 文件传输 / 远程登录
+    "ftp": 21, "ftps": 21, "ftpes": 21, "sftp": 22, "ssh": 22, "scp": 22,
+    "telnet": 23, "rsync": 873, "tftp": 69, "nfs": 2049, "smb": 445, "cifs": 445,
+    # 邮件
+    "smtp": 25, "submission": 587, "smtps": 465,
+    "pop3": 110, "pop3s": 995, "imap": 143, "imaps": 993,
+    # 目录 / 版本控制
+    "ldap": 389, "ldaps": 636, "nntp": 119,
+    "git": 9418, "svn": 3690, "svn+ssh": 22,
+    # 远程桌面 / 流媒体
+    "rdp": 3389, "vnc": 5900, "rtsp": 554, "rtmp": 1935,
+    # 数据库 / 缓存 / 消息队列
+    "mysql": 3306, "mariadb": 3306, "postgres": 5432, "postgresql": 5432,
+    "mongodb": 27017, "mongodb+srv": 27017, "redis": 6379, "memcached": 11211,
+    "elasticsearch": 9200, "kafka": 9092, "zookeeper": 2181, "etcd": 2379,
+    "mqtt": 1883, "mqtts": 8883, "amqp": 5672, "amqps": 5671,
+    # 代理 / 其它
+    "socks": 1080, "socks5": 1080, "socks4": 1080,
+    "irc": 6667, "ircs": 6697, "xmpp": 5222, "docker": 2375,
+}
+
+# 端口 → 服务名。两处用途：
+#   1. 归因时判断「这个端口是不是该服务的标准端口」，避免对 ssh(22) 这种
+#      本来就正确的端口报「不像是标准端口」；
+#   2. 服务标识层用来告诉用户「22 上跑的确实是 SSH」。
+PORT_SERVICES: dict[int, str] = {
+    20: "FTP 数据", 21: "FTP", 22: "SSH / SFTP", 23: "Telnet", 25: "SMTP",
+    53: "DNS", 69: "TFTP", 70: "Gopher", 80: "HTTP", 110: "POP3",
+    119: "NNTP", 123: "NTP", 143: "IMAP", 161: "SNMP", 389: "LDAP",
+    443: "HTTPS", 445: "SMB", 465: "SMTPS", 514: "Syslog", 554: "RTSP",
+    587: "SMTP 提交", 636: "LDAPS", 873: "rsync", 993: "IMAPS", 995: "POP3S",
+    1080: "SOCKS 代理", 1433: "SQL Server", 1521: "Oracle", 1883: "MQTT",
+    1935: "RTMP", 2049: "NFS", 2181: "ZooKeeper", 2375: "Docker API",
+    2379: "etcd", 3306: "MySQL", 3389: "RDP", 3690: "SVN", 5222: "XMPP",
+    5432: "PostgreSQL", 5672: "AMQP", 5900: "VNC", 6379: "Redis",
+    6667: "IRC", 8080: "HTTP 备用", 8443: "HTTPS 备用", 8883: "MQTT over TLS",
+    9200: "Elasticsearch", 9418: "Git", 11211: "Memcached", 27017: "MongoDB",
+}
+
+# 会「先开口」的服务：连上之后服务端不等客户端发数据就会送出自己的标识。
+# 只有这些端口值得去读 banner；像 Redis / HTTP 那种要客户端先发请求的，读了也是空等。
+BANNER_PORTS: dict[int, str] = {
+    21: "FTP", 22: "SSH", 23: "Telnet", 25: "SMTP", 110: "POP3",
+    143: "IMAP", 554: "RTSP", 5222: "XMPP", 5900: "VNC", 6667: "IRC",
+}
+
+# 各服务 banner 的特征前缀 → 说明它确实是该服务
+BANNER_RULES: dict[int, tuple[tuple[str, ...], str]] = {
+    22: (("ssh-",), "SSH"),
+    21: (("220",), "FTP"),
+    25: (("220",), "SMTP"),
+    110: (("+ok",), "POP3"),
+    143: (("* ok",), "IMAP"),
+    554: (("rtsp",), "RTSP"),
+    5900: (("rfb",), "VNC"),
+    6667: ((":",), "IRC"),
+    5222: (("xml", "stream"), "XMPP"),
+}
+
+
+def service_of_port(port: int) -> str:
+    """端口对应的服务名；未知返回空串。"""
+    try:
+        return PORT_SERVICES.get(int(port), "")
+    except (TypeError, ValueError):
+        return ""
+
+
+# 反查端口对应的协议名（仅用于展示，如把 22 显示成 ssh://）。
+# 同一端口有多个别名时按这个顺序取第一个 —— 要的是最通用的那个写法。
+_SCHEME_PREFERRED = (
+    "http", "https", "ftp", "ssh", "sftp", "telnet",
+    "smtp", "smtps", "pop3", "pop3s", "imap", "imaps",
+    "ldap", "ldaps", "nntp", "git", "svn", "rsync",
+    "rdp", "vnc", "rtsp", "rtmp",
+    "mysql", "postgresql", "mongodb", "redis", "memcached",
+    "elasticsearch", "kafka", "zookeeper", "etcd",
+    "mqtt", "amqp", "irc", "xmpp", "smb", "nfs", "tftp", "docker",
+    "socks5", "ws", "wss",
+)
+
+
+def scheme_for_port(port: int) -> str:
+    """端口 → 协议名（展示用）。认不出返回空串。
+
+    只用来把「22」这样的端口在界面上写成 `ssh://`，解析方向始终是协议 → 端口，
+    反向查询不影响任何判定。
+    """
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return ""
+    for scheme in _SCHEME_PREFERRED:
+        if SCHEME_PORTS.get(scheme) == port:
+            return scheme
+    return ""
+
+
+def probe_banner(ip: str, port: int, timeout: float = 3.0) -> tuple[str, str]:
+    """读一次服务标识（banner）。
+
+    返回 (kind, text)：
+        kind = "banner"  读到了标识，text 是首行
+        kind = "silent"  连接成功但服务端没先说话（多半是 TLS 服务，或需要客户端先发）
+        kind = "error"   连不上，text 是原因
+    本函数永不抛异常 —— 它只是锦上添花的一层，不该把整轮诊断带崩。
+    """
+    if port not in BANNER_PORTS:
+        return "silent", ""
+    try:
+        with socket.create_connection((ip, port), timeout=timeout) as sock:
+            sock.settimeout(timeout)
+            try:
+                chunk = sock.recv(256)
+            except socket.timeout:
+                return "silent", ""
+            except OSError as exc:
+                return "error", str(exc)
+    except socket.timeout:
+        return "error", "连接超时"
+    except OSError as exc:
+        return "error", str(exc)
+
+    if not chunk:
+        return "silent", ""
+    text = chunk.decode("utf-8", "replace").strip()
+    first = text.splitlines()[0].strip() if text else ""
+    # telnet 这类会先发协商字节，直接展示会满屏乱码，退化成十六进制
+    if first and sum(1 for ch in first if ord(ch) < 32) > len(first) // 3:
+        return "banner", " ".join(f"\\x{b:02x}" for b in chunk[:16])
+    return ("banner", first) if first else ("silent", "")
+
+
+def banner_matches(port: int, text: str) -> tuple[bool, str]:
+    """banner 是否与端口应有的服务对得上。返回 (是否匹配, 服务名)。"""
+    rules = BANNER_RULES.get(port)
+    if not rules:
+        return True, BANNER_PORTS.get(port, "")
+    keys, name = rules
+    lo = text.lower()
+    for key in keys:
+        if lo.startswith(key) or key in lo[:40]:
+            return True, name
+    return False, name
+
+
 def probe_local_proxy_ports(host="127.0.0.1", timeout=0.35) -> list[int]:
     """探测本机常见代理端口是否在监听——用于判断「代理软件没开」这类常见坑。"""
     open_ports: list[int] = []
@@ -1257,6 +1411,82 @@ def tcp_probe(ip: str, port: int, timeout: float = 4.0) -> tuple[str, float]:
             sock.close()
         except Exception:
             pass
+
+
+class StepService(Step):
+    """非 Web 协议的「服务标识」层。
+
+    Web 端口有 HTTP / TLS / 网页三层去验证，非 Web 的（ssh / ftp / smtp…）却只有
+    一次 TCP 握手 —— 那个只能证明「端口开着」，证明不了「对端确实是那个服务」。
+    这一层补上后半句：连上去读服务自己报出的标识。
+    """
+
+    key = "service"
+    title = "服务与协议识别"
+
+    def run(self) -> CheckResult:
+        port = self.ctx.port
+        if port in (80, 443, 8080, 8443):
+            return self.skipped("Web 端口，由后面的 HTTP / TLS / 网页三层负责验证。")
+
+        proxy = self.ctx.proxy if self.ctx.proxy else read_system_proxy()
+        if proxy.get("enabled") and parse_proxy_server(proxy.get("server", "")):
+            return self.skipped("当前启用系统代理，直连读到的不会是目标服务本身。")
+        if not self.ctx.resolved:
+            return self.skipped("域名未解析成功，无法读取服务标识（问题在 DNS 层）。")
+        if not self.ctx.findings.get("tcp_open"):
+            return self.skipped("目标端口未连通，读不到服务标识。")
+
+        expected = BANNER_PORTS.get(port, "")
+        service = service_of_port(port)
+        ip = self.ctx.resolved[0]
+
+        # 端口能对上已知服务，但该服务不会主动报标识（Redis / MySQL / HTTP…）——
+        # 只如实说明「到哪一步为止」，不硬凑一个结论。
+        if not expected:
+            if service:
+                return self.result(
+                    Level.INFO, f"端口 {port} 可达，对应 {service}",
+                    f"· {ip}:{port} TCP 握手正常。\n"
+                    f"· {service} 不主动报出标识，这里只能确认端口连通；"
+                    "要确认服务身份需发协议请求，本工具不做主动探测。")
+            return self.skipped(f"端口 {port} 不在已知服务清单里，不做协议识别。")
+
+        t0 = time.perf_counter()
+        kind, text = probe_banner(ip, port, timeout=min(self.ctx.timeout, 3.0))
+        dt = time.perf_counter() - t0
+
+        if kind == "banner":
+            ok, name = banner_matches(port, text)
+            self.ctx.findings["service_ok"] = ok
+            self.ctx.findings["service_banner"] = text
+            label = name or expected
+            if ok:
+                return self.result(
+                    Level.OK, f"{label} 服务响应：{text[:60]}",
+                    f"· {ip}:{port} 返回标识：{text}\n"
+                    f"· 与端口 {port} 应有的服务（{service or expected}）一致。",
+                    duration=dt)
+            return self.result(
+                Level.WARN, f"{label} 端口上的应答与预期不符",
+                f"· {ip}:{port} 上应答的是：{text}\n"
+                f"· 按端口 {port} 预期是 {expected}，实际对不上，该端口可能被改作他用。",
+                [f"确认端口号是否填错；{port} 上跑的未必是 {expected}。"], dt)
+
+        if kind == "error":
+            self.ctx.findings["service_ok"] = False
+            return self.result(
+                Level.WARN, "端口已连通，但读服务标识失败",
+                f"· {ip}:{port} TCP 握手成功，随后读取标识时报错：{text}\n"
+                "· 端口是通的，只是对端没有按预期应答。", duration=dt)
+
+        # silent：连上了，但服务端没有先开口
+        self.ctx.findings["service_ok"] = None
+        return self.result(
+            Level.INFO, f"端口 {port} 可达，但服务端未主动应答",
+            f"· {ip}:{port} TCP 握手成功，{min(self.ctx.timeout, 3.0):.0f} 秒内没收到服务标识。\n"
+            f"· {expected} 通常会先报标识；保持沉默可能是套了 TLS，"
+            "也可能对端做了访问控制（只对白名单放行）。", duration=dt)
 
 
 class StepProxy(Step):
@@ -2035,9 +2265,11 @@ class StepHttpProxyAdvice(Step):
         summary = "；".join(problems)
         level = Level.FAIL if (not tcp_ok or len(problems) > 1) else Level.WARN
 
-        nonstandard = self.ctx.port not in (80, 443, 8080, 8443)
+        # 端口是不是该服务的标准端口，认得出来就别乱劝 —— 用户粘的是
+        # ssh://host，22 本来就是对的，再提示「端口可能填错」只会误导。
+        nonstandard = not service_of_port(self.ctx.port)
         if tcp_blocked and nonstandard:
-            advice.append(f"{self.ctx.port} 不像是该服务的标准端口，先确认端口号是否填错"
+            advice.append(f"{self.ctx.port} 不在常见服务端口里，先确认端口号是否填错"
                           "（Web 通常是 443，明文是 80）。")
         if tcp_blocked and not used_proxy:
             advice.append("换一个网络（如手机热点）复测：若热点下正常，即可确认是当前网络出口的限制。")
@@ -2059,6 +2291,7 @@ def default_steps() -> list[type[Step]]:
         StepDns,
         StepPing,
         StepTcp,
+        StepService,
         StepProxy,
         StepBrowserProxy,
         StepHttp,
@@ -2155,11 +2388,15 @@ def parse_target(raw: str, default_port: int = 443) -> tuple[str, str, int]:
         https://github.com/login?tab=repositories#top
         https://user:pw@host.com:8443/a/b?a=1
         [::1]:443
+        ssh://git@github.com                  （非 Web 协议按协议默认端口：22）
+        ftp://ftp.example.com/pub/file        （21）
+        imaps://mail.example.com/INBOX        （993）
         <https://github.com>            （聊天软件里的尖括号包裹）
         https://github.com/login 还有后文   （前后带说明文字）
         **https://github.com**          （markdown 加粗）
         "https://github.com/login"      （带引号）
 
+    自带协议的链接按 SCHEME_PORTS 取默认端口；URL 里显式写了端口的以显式值为准。
     解析不出来时退化为「把整串当 host」，绝不抛异常——输入框里什么都可能被贴进来。
     """
     text = normalize_input(raw)
@@ -2172,10 +2409,16 @@ def parse_target(raw: str, default_port: int = 443) -> tuple[str, str, int]:
     if m:
         scheme = m.group(1).lower()
         text = text[m.end():]
+        # 端口必须跟着协议走。只剥掉协议前缀、端口仍留 443 的话，
+        # `ssh://host` 会去测 443，`ftp://host` 也去测 443 —— 结论从根上就是错的。
+        # http/https 沿用原来的条件写法（尊重调用方传入的 default_port），
+        # 其余协议直接取该协议的默认端口；URL 里显式写了端口则以后者为准（见下面）。
         if scheme == "http" and default_port == 443:
             port = 80
         elif scheme == "https" and default_port == 80:
             port = 443
+        elif scheme not in ("http", "https") and scheme in SCHEME_PORTS:
+            port = SCHEME_PORTS[scheme]
     # 常见的无协议写法：//host/path
     elif text.startswith("//"):
         text = text[2:]

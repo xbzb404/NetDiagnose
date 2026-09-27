@@ -20,6 +20,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from diagnoser import (  # noqa: E402
     COMMON_TARGETS,
     IS_WINDOWS,
+    SCHEME_PORTS,
     CheckResult,
     DiagnosisEngine,
     Level,
@@ -27,10 +28,25 @@ from diagnoser import (  # noqa: E402
     parse_proxy_server,
     parse_target,
     read_system_proxy,
+    scheme_for_port,
 )
 
 APP_TITLE = "网络诊断 · NetDiagnose"
-APP_VERSION = "1.3"
+APP_VERSION = "1.4"
+
+
+def _display_url(host: str, port: int, path: str = "/") -> str:
+    """把目标拼成给人看的 URL。
+
+    端口认得出来就按协议写（22 → `ssh://`、3389 → `rdp://`、6379 → `redis://`），
+    认不出才退回 http/https —— 否则用户粘的是 `ssh://github.com`，界面却回显成
+    `http://github.com:22/`，看着像被改错了。协议的默认端口不再重复写出。
+    """
+    scheme = scheme_for_port(port) or ("https" if port in (443, 8443) else "http")
+    path = path if path.startswith("/") else "/" + path
+    if port in (80, 443) or SCHEME_PORTS.get(scheme) == port:
+        return f"{scheme}://{host}{path}"
+    return f"{scheme}://{host}:{port}{path}"
 
 # ------------------------------------------------------------------ 设计令牌
 # 参考 WorkBuddy 的浅色视觉：白底卡片 + 极浅边框 + 单一强调色
@@ -339,7 +355,7 @@ class App:
         self.stop_flag = threading.Event()
         # 初始值只是占位：真正跑起来时用 run_engine 里的 len(engine.steps) 覆盖，
         # 免得以后增删步骤还要记得改这里。
-        self.total_steps = 14
+        self.total_steps = 15
         self.done_steps = 0
         self.port_var = tk.StringVar(value="443")
 
@@ -656,13 +672,6 @@ class App:
         except Exception:
             pass
 
-    def quick_fill(self, host: str, port: int):
-        scheme = "https" if port in (443, 8443) else "http"
-        need_port = port not in (80, 443)
-        netloc = f"{host}:{port}" if need_port else host
-        self.host_var.set(f"{scheme}://{netloc}/")
-        self.start()
-
     def update_stats(self):
         for w in self.stats_box.winfo_children():
             w.destroy()
@@ -781,10 +790,7 @@ class App:
             self.parsed_hint.configure(text=f"将诊断：{shown}    （已从粘贴内容中解析）")
 
     def quick_fill(self, host: str, port: int):
-        scheme = "https" if port in (443, 8443) else "http"
-        need_port = port not in (80, 443)
-        netloc = f"{host}:{port}" if need_port else host
-        self.host_var.set(f"{scheme}://{netloc}/")
+        self.host_var.set(_display_url(host, port))
         self.start()
 
     def start(self):
@@ -794,10 +800,7 @@ class App:
         # 直接把链接粘进来即可：host / 路径 / 端口由解析器统一拆开。
         # 解析空值会退化成 github.com，所以这里不用再兜一次。
         host, path, port = parse_target(raw, 443)
-        shown_url = f"{'https' if port in (443, 8443) else 'http'}://{host}"
-        if port not in (80, 443):
-            shown_url += f":{port}"
-        shown_url += path
+        shown_url = _display_url(host, port, path)
         self.host_var.set(shown_url)
         self.port_var.set(str(port))  # 仅用于报告展示
 
